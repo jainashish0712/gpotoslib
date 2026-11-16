@@ -2,11 +2,11 @@ name: Build GooglePhotosCloudViewer Dylib
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - '**'
     tags:
-      - 'v*'
+      - '**'
   pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
     inputs:
       create_release:
@@ -35,7 +35,7 @@ jobs:
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "Using SDK at: $SDK_PATH"
-          
+
           xcrun -sdk iphoneos clang++ -arch arm64 -arch arm64e \
             -shared -dynamiclib \
             -Wall -O3 \
@@ -61,17 +61,27 @@ jobs:
           path: GooglePhotosCloudViewer.dylib
           if-no-files-found: error
 
+      - name: Determine Release Tag
+        id: release_tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="v1.0.${{ github.run_number }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
       - name: Create GitHub Release
-        if: (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true') && github.event_name != 'pull_request'
+        if: (startsWith(github.ref, 'refs/tags/') || github.event.inputs.create_release == 'true' || github.event_name == 'push') && github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           files: GooglePhotosCloudViewer.dylib
-          tag_name: ${{ github.ref_name || format('v1.0.{0}', github.run_number) }}
-          name: GooglePhotosCloudViewer ${{ github.ref_name || format('v1.0.{0}', github.run_number) }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: GooglePhotosCloudViewer ${{ steps.release_tag.outputs.tag }}
           body: |
             ### GooglePhotosCloudViewer Release
             Built from commit `${{ github.sha }}`.
-            
+
             **Features:**
             - Bypasses `startEnvelopeSyncAfterPreInitialSyncComplete:` to sync cloud albums without local `PHPhotoLibrary` permission.
             - Short-circuits `localDedupKeysCompletePromiseAtomic` to eliminate thumbnail loading hangs inside albums.
