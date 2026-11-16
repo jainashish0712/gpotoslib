@@ -1,0 +1,82 @@
+name: Build GooglePhotosCloudViewer Dylib
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish as GitHub Release?'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Verify Xcode & iOS SDK
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Compile iOS Dylib (arm64 + arm64e)
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Using SDK at: $SDK_PATH"
+          
+          xcrun -sdk iphoneos clang++ -arch arm64 -arch arm64e \
+            -shared -dynamiclib \
+            -Wall -O3 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.0 \
+            -framework Foundation -framework UIKit \
+            -fobjc-arc \
+            -install_name @rpath/GooglePhotosCloudViewer.dylib \
+            GooglePhotosCloudViewer.mm \
+            -o GooglePhotosCloudViewer.dylib
+
+          # Ad-hoc codesign
+          codesign -f -s - GooglePhotosCloudViewer.dylib
+
+          # Display architecture and info
+          file GooglePhotosCloudViewer.dylib
+          otool -L GooglePhotosCloudViewer.dylib
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GooglePhotosCloudViewer-dylib
+          path: GooglePhotosCloudViewer.dylib
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true') && github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: GooglePhotosCloudViewer.dylib
+          tag_name: ${{ github.ref_name || format('v1.0.{0}', github.run_number) }}
+          name: GooglePhotosCloudViewer ${{ github.ref_name || format('v1.0.{0}', github.run_number) }}
+          body: |
+            ### GooglePhotosCloudViewer Release
+            Built from commit `${{ github.sha }}`.
+            
+            **Features:**
+            - Bypasses `startEnvelopeSyncAfterPreInitialSyncComplete:` to sync cloud albums without local `PHPhotoLibrary` permission.
+            - Short-circuits `localDedupKeysCompletePromiseAtomic` to eliminate thumbnail loading hangs inside albums.
+            - Enables instant viewing of cloud albums (including Android-synced albums) in Google Photos iOS.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
