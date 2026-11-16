@@ -5,11 +5,13 @@
 //  Purpose:
 //  Allows Google Photos iOS to function as a fast remote cloud viewer
 //  when iOS Photo Library permissions are intentionally denied/withheld.
+//  - Unblocks Onboarding deadlock after tapping "Continue without backup".
 //  - Unblocks Envelope (Album) Sync from being held hostage by PreInitialSync.
 //  - Prevents Local Deduplication Promise from stalling thumbnail rendering.
 //  - Instantly populates Android-synced cloud albums in Collections & Albums views.
 //
 
+#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -30,6 +32,72 @@ static void SwizzleInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) 
     } else {
         LOG("Method -[%s %s] not found", class_getName(cls), sel_getName(sel));
     }
+}
+
+#pragma mark - Hook: PHSRootViewController & Onboarding Dismissal Unblocking
+
+static BOOL g_forceOOBFinished = NO;
+
+static BOOL (*orig_root_displayingOOB)(id self, SEL _cmd);
+static BOOL hook_root_displayingOOB(id self, SEL _cmd) {
+    if (g_forceOOBFinished) {
+        return NO;
+    }
+    if (orig_root_displayingOOB) {
+        return orig_root_displayingOOB(self, _cmd);
+    }
+    return NO;
+}
+
+static void (*orig_root_checkAndRequestPhotoLibraryAccessIfNeeded)(id self, SEL _cmd);
+static void hook_root_checkAndRequestPhotoLibraryAccessIfNeeded(id self, SEL _cmd) {
+    LOG("Suppressed checkAndRequestPhotoLibraryAccessIfNeeded (running in cloud viewer mode)");
+    // No-op: do not prompt or wait for Apple Photo Library permissions
+}
+
+static void (*orig_enableAutoBackup_rejectAutoBackupAndDismiss)(id self, SEL _cmd);
+static void hook_enableAutoBackup_rejectAutoBackupAndDismiss(id self, SEL _cmd) {
+    LOG("rejectAutoBackupAndDismiss intercepted (User tapped 'Continue without backup')");
+    g_forceOOBFinished = YES;
+
+    if (orig_enableAutoBackup_rejectAutoBackupAndDismiss) {
+        orig_enableAutoBackup_rejectAutoBackupAndDismiss(self, _cmd);
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+                    window = ((UIWindowScene *)scene).windows.firstObject;
+                    if (window) break;
+                }
+            }
+        }
+        if (!window) {
+            window = [UIApplication sharedApplication].keyWindow;
+        }
+
+        UIViewController *rootVC = window.rootViewController;
+        if (rootVC && [rootVC isKindOfClass:NSClassFromString(@"PHSRootViewController")]) {
+            LOG("Transitioning PHSRootViewController to main tab bar post-dismissal...");
+            SEL compSel = NSSelectorFromString(@"onboardingDidCompleteWithState:postOnboardingBehavior:");
+            if ([rootVC respondsToSelector:compSel]) {
+                ((void (*)(id, SEL, id, id))objc_msgSend)(rootVC, compSel, nil, nil);
+            }
+
+            SEL setupSel = NSSelectorFromString(@"setupTabBarControllerWithAccount:destination:");
+            if ([rootVC respondsToSelector:setupSel]) {
+                id account = nil;
+                @try {
+                    account = [rootVC valueForKey:@"viewingAccount"];
+                } @catch (NSException *e) {}
+                if (account) {
+                    ((void (*)(id, SEL, id, id))objc_msgSend)(rootVC, setupSel, account, nil);
+                }
+            }
+        }
+    });
 }
 
 #pragma mark - Hook: PHSExtendedCollectionStore (Envelope Sync Unblocking)
@@ -131,6 +199,31 @@ __attribute__((constructor))
 static void initGooglePhotosCloudViewer(void) {
     @autoreleasepool {
         LOG("Initializing GooglePhotosCloudViewer dylib patch...");
+
+        // 0. Hook Onboarding & Root Navigation to prevent freeze after 'Continue without backup'
+        Class autoBackupVCCls = NSClassFromString(@"PHSEnableAutoBackupViewControllerV2");
+        if (!autoBackupVCCls) {
+            autoBackupVCCls = NSClassFromString(@"PHSEnableAutoBackupViewController");
+        }
+        if (autoBackupVCCls) {
+            SwizzleInstanceMethod(autoBackupVCCls,
+                                  NSSelectorFromString(@"rejectAutoBackupAndDismiss"),
+                                  (IMP)hook_enableAutoBackup_rejectAutoBackupAndDismiss,
+                                  (IMP *)&orig_enableAutoBackup_rejectAutoBackupAndDismiss);
+        }
+
+        Class rootVCCls = NSClassFromString(@"PHSRootViewController");
+        if (rootVCCls) {
+            SwizzleInstanceMethod(rootVCCls,
+                                  NSSelectorFromString(@"displayingOOB"),
+                                  (IMP)hook_root_displayingOOB,
+                                  (IMP *)&orig_root_displayingOOB);
+
+            SwizzleInstanceMethod(rootVCCls,
+                                  NSSelectorFromString(@"checkAndRequestPhotoLibraryAccessIfNeeded"),
+                                  (IMP)hook_root_checkAndRequestPhotoLibraryAccessIfNeeded,
+                                  (IMP *)&orig_root_checkAndRequestPhotoLibraryAccessIfNeeded);
+        }
 
         // 1. Hook PHSExtendedCollectionStore
         Class storeCls = NSClassFromString(@"PHSExtendedCollectionStore");
