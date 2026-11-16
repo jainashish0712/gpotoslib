@@ -57,7 +57,7 @@ jobs:
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GooglePhotosCloudViewer-dylib
+          name: GooglePhotosCloudViewer.dylib
           path: GooglePhotosCloudViewer.dylib
           if-no-files-found: error
 
