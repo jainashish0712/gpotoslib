@@ -6,9 +6,11 @@
 //  Allows Google Photos iOS to function as a fast remote cloud viewer
 //  when iOS Photo Library permissions are intentionally denied/withheld.
 //  - Unblocks Onboarding deadlock after tapping "Continue without backup".
+//  - Starts and drives PHSSynchronizerManager so remote Android-synced albums
+//    and user items are synced from Google Cloud without local photo access.
 //  - Unblocks Envelope (Album) Sync from being held hostage by PreInitialSync.
 //  - Prevents Local Deduplication Promise from stalling thumbnail rendering.
-//  - Instantly populates Android-synced cloud albums in Collections & Albums views.
+//  - Instantly populates cloud albums in Collections & Albums views.
 //
 
 #import <UIKit/UIKit.h>
@@ -34,7 +36,7 @@ static void SwizzleInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) 
     }
 }
 
-#pragma mark - Hook: PHSRootViewController & Onboarding Dismissal Unblocking
+#pragma mark - Hook: PHSRootViewController & Onboarding Dismissal
 
 static BOOL g_forceOOBFinished = NO;
 
@@ -51,8 +53,19 @@ static BOOL hook_root_displayingOOB(id self, SEL _cmd) {
 
 static void (*orig_root_checkAndRequestPhotoLibraryAccessIfNeeded)(id self, SEL _cmd);
 static void hook_root_checkAndRequestPhotoLibraryAccessIfNeeded(id self, SEL _cmd) {
-    LOG("Suppressed checkAndRequestPhotoLibraryAccessIfNeeded (running in cloud viewer mode)");
-    // No-op: do not prompt or wait for Apple Photo Library permissions
+    LOG("checkAndRequestPhotoLibraryAccessIfNeeded intercepted: running restoration and synchronizer startup");
+    if (orig_root_checkAndRequestPhotoLibraryAccessIfNeeded) {
+        orig_root_checkAndRequestPhotoLibraryAccessIfNeeded(self, _cmd);
+    } else {
+        SEL restSel = NSSelectorFromString(@"beginRestoration");
+        if ([self respondsToSelector:restSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(self, restSel);
+        }
+        SEL startSel = NSSelectorFromString(@"start");
+        if ([self respondsToSelector:startSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(self, startSel);
+        }
+    }
 }
 
 static void (*orig_enableAutoBackup_rejectAutoBackupAndDismiss)(id self, SEL _cmd);
@@ -96,11 +109,57 @@ static void hook_enableAutoBackup_rejectAutoBackupAndDismiss(id self, SEL _cmd) 
                     ((void (*)(id, SEL, id, id))objc_msgSend)(rootVC, setupSel, account, nil);
                 }
             }
+
+            // Immediately boot synchronization engine so remote cloud albums populate
+            SEL bootSel = NSSelectorFromString(@"checkAndRequestPhotoLibraryAccessIfNeeded");
+            if ([rootVC respondsToSelector:bootSel]) {
+                LOG("Invoking checkAndRequestPhotoLibraryAccessIfNeeded to awaken synchronizers");
+                ((void (*)(id, SEL))objc_msgSend)(rootVC, bootSel);
+            } else {
+                SEL restSel = NSSelectorFromString(@"beginRestoration");
+                if ([rootVC respondsToSelector:restSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(rootVC, restSel);
+                }
+                SEL startSel = NSSelectorFromString(@"start");
+                if ([rootVC respondsToSelector:startSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(rootVC, startSel);
+                }
+            }
         }
     });
 }
 
-#pragma mark - Hook: PHSExtendedCollectionStore (Envelope Sync Unblocking)
+#pragma mark - Hook: PHSSynchronizerManager (Awaken Cloud Sync)
+
+static id (*orig_syncManager_init)(id self, SEL _cmd);
+static id hook_syncManager_init(id self, SEL _cmd) {
+    id instance = orig_syncManager_init ? orig_syncManager_init(self, _cmd) : self;
+    if (instance) {
+        LOG("PHSSynchronizerManager init intercepted -> enabling synchronizers immediately");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            SEL enableSel = NSSelectorFromString(@"enable");
+            if ([instance respondsToSelector:enableSel]) {
+                ((void (*)(id, SEL))objc_msgSend)(instance, enableSel);
+            }
+        });
+    }
+    return instance;
+}
+
+static BOOL (*orig_syncManager_enabled)(id self, SEL _cmd);
+static BOOL hook_syncManager_enabled(id self, SEL _cmd) {
+    return YES;
+}
+
+static void (*orig_syncManager_setEnabled)(id self, SEL _cmd, BOOL enabled);
+static void hook_syncManager_setEnabled(id self, SEL _cmd, BOOL enabled) {
+    LOG("PHSSynchronizerManager setEnabled: called with %d (enforcing YES)", enabled);
+    if (orig_syncManager_setEnabled) {
+        orig_syncManager_setEnabled(self, _cmd, YES);
+    }
+}
+
+#pragma mark - Hook: PHSExtendedCollectionStore (Envelope & Album Sync)
 
 static id (*orig_store_initWithStoreHelper_serverPhotosPartiallyRestored)(id self, SEL _cmd, id helper, BOOL restored);
 static id hook_store_initWithStoreHelper_serverPhotosPartiallyRestored(id self, SEL _cmd, id helper, BOOL restored) {
@@ -133,6 +192,10 @@ static id hook_store_initWithStoreHelper_serverPhotosPartiallyRestored_skipSchem
             if ([instance respondsToSelector:syncSel]) {
                 ((void (*)(id, SEL, BOOL))objc_msgSend)(instance, syncSel, YES);
             }
+            SEL reasonSel = NSSelectorFromString(@"startSyncWithReason:");
+            if ([instance respondsToSelector:reasonSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(instance, reasonSel, @"CloudViewerStart");
+            }
         });
     }
     return instance;
@@ -141,7 +204,9 @@ static id hook_store_initWithStoreHelper_serverPhotosPartiallyRestored_skipSchem
 static void (*orig_store_startEnvelopeSyncAfterPreInitialSyncComplete)(id self, SEL _cmd, BOOL complete);
 static void hook_store_startEnvelopeSyncAfterPreInitialSyncComplete(id self, SEL _cmd, BOOL complete) {
     LOG("Intercepted startEnvelopeSyncAfterPreInitialSyncComplete: (input was %d, enforcing YES)", complete);
-    orig_store_startEnvelopeSyncAfterPreInitialSyncComplete(self, _cmd, YES);
+    if (orig_store_startEnvelopeSyncAfterPreInitialSyncComplete) {
+        orig_store_startEnvelopeSyncAfterPreInitialSyncComplete(self, _cmd, YES);
+    }
 }
 
 #pragma mark - Hook: Initial Sync State Flags
@@ -225,7 +290,28 @@ static void initGooglePhotosCloudViewer(void) {
                                   (IMP *)&orig_root_checkAndRequestPhotoLibraryAccessIfNeeded);
         }
 
-        // 1. Hook PHSExtendedCollectionStore
+        // 1. Hook PHSSynchronizerManager to ensure synchronization runs in cloud viewer mode
+        Class syncManagerCls = NSClassFromString(@"PHSSynchronizerManager");
+        if (syncManagerCls) {
+            SwizzleInstanceMethod(syncManagerCls,
+                                  NSSelectorFromString(@"init"),
+                                  (IMP)hook_syncManager_init,
+                                  (IMP *)&orig_syncManager_init);
+
+            SwizzleInstanceMethod(syncManagerCls,
+                                  NSSelectorFromString(@"enabled"),
+                                  (IMP)hook_syncManager_enabled,
+                                  (IMP *)&orig_syncManager_enabled);
+
+            SwizzleInstanceMethod(syncManagerCls,
+                                  NSSelectorFromString(@"setEnabled:"),
+                                  (IMP)hook_syncManager_setEnabled,
+                                  (IMP *)&orig_syncManager_setEnabled);
+        } else {
+            LOG("WARNING: PHSSynchronizerManager class not found yet");
+        }
+
+        // 2. Hook PHSExtendedCollectionStore
         Class storeCls = NSClassFromString(@"PHSExtendedCollectionStore");
         if (storeCls) {
             SwizzleInstanceMethod(storeCls,
@@ -246,7 +332,7 @@ static void initGooglePhotosCloudViewer(void) {
             LOG("WARNING: PHSExtendedCollectionStore class not found yet");
         }
 
-        // 2. Hook PHSExtendedCollectionSynchronizer
+        // 3. Hook PHSExtendedCollectionSynchronizer
         Class extSyncCls = NSClassFromString(@"PHSExtendedCollectionSynchronizer");
         if (extSyncCls) {
             SwizzleInstanceMethod(extSyncCls,
@@ -255,7 +341,7 @@ static void initGooglePhotosCloudViewer(void) {
                                   (IMP *)&orig_extendedSync_initialSyncComplete);
         }
 
-        // 3. Hook PHSUserItemsSynchronizer
+        // 4. Hook PHSUserItemsSynchronizer
         Class userItemsCls = NSClassFromString(@"PHSUserItemsSynchronizer");
         if (userItemsCls) {
             SwizzleInstanceMethod(userItemsCls,
@@ -274,7 +360,7 @@ static void initGooglePhotosCloudViewer(void) {
                                   (IMP *)&orig_userItems_localDedupKeysCompletePromiseAtomic);
         }
 
-        // 4. Hook PHSUserSettingsImpl / PHSUserSettings
+        // 5. Hook PHSUserSettingsImpl / PHSUserSettings
         Class settingsCls = NSClassFromString(@"PHSUserSettingsImpl");
         if (settingsCls) {
             SwizzleInstanceMethod(settingsCls,
